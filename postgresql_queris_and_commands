@@ -1,0 +1,156 @@
+Useful PostgreSQL Queries & Commands
+All sizes in MB, change /1024/1024 to /1024/1024/1024 for GB.
+
+Databases sizes
+Without system databases
+
+select
+datname as database,
+(pg_database_size(datname)/1024/1024) as size
+from pg_database
+where datname not in ('postgres','template0','template1')
+order by pg_database_size(datname) desc;
+Table sizes
+Shows total, toast and indexes sizes. After big changes remember to vacuum full;
+
+WITH RECURSIVE pg_inherit(inhrelid, inhparent) AS
+    (select inhrelid, inhparent
+    FROM pg_inherits
+    UNION
+    SELECT child.inhrelid, parent.inhparent
+    FROM pg_inherit child, pg_inherits parent
+    WHERE child.inhparent = parent.inhrelid),
+pg_inherit_short AS (SELECT * FROM pg_inherit WHERE inhparent NOT IN (SELECT inhrelid FROM pg_inherit))
+SELECT TABLE_NAME
+    , row_estimate
+    , cast(total_bytes/1024/1024 as numeric(12,2)) AS total
+    , cast(table_bytes/1024/1024 as numeric(12,2)) AS table
+    , cast(toast_bytes/1024/1024 as numeric(12,2)) AS toast
+    , cast(index_bytes/1024/1024 as numeric(12,2)) AS index
+  FROM (
+    SELECT *, total_bytes-index_bytes-COALESCE(toast_bytes,0) AS table_bytes
+    FROM (
+         SELECT c.oid
+              , relname AS TABLE_NAME
+              , SUM(c.reltuples) OVER (partition BY parent) AS row_estimate
+              , SUM(pg_total_relation_size(c.oid)) OVER (partition BY parent) AS total_bytes
+              , SUM(pg_indexes_size(c.oid)) OVER (partition BY parent) AS index_bytes
+              , SUM(pg_total_relation_size(reltoastrelid)) OVER (partition BY parent) AS toast_bytes
+              , parent
+          FROM (
+                SELECT pg_class.oid
+                    , reltuples
+                    , relname
+                    , relnamespace
+                    , pg_class.reltoastrelid
+                    , COALESCE(inhparent, pg_class.oid) parent
+                FROM pg_class
+                    LEFT JOIN pg_inherit_short ON inhrelid = oid
+                WHERE relkind IN ('r', 'p', 'm')
+             ) c
+             LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE nspname NOT IN ('pg_catalog','information_schema')
+  ) a
+  WHERE oid = parent
+) a
+ORDER BY total_bytes DESC;
+All elements sizes
+Tables, indexes, views, sequences,... in a simple list
+
+select
+relkind as type,
+relname as name,
+(pg_relation_size(pg_catalog.pg_class.oid)/1024/1024) as size,
+reltuples as rows
+from pg_catalog.pg_class
+join pg_catalog.pg_namespace on relnamespace = pg_catalog.pg_namespace.oid
+where pg_catalog.pg_namespace.nspname not in ('pg_catalog','pg_toast','information_schema')
+order by relkind desc, relname desc;
+Heap stats
+SELECT
+SUM(heap_blks_read) AS heap_read,
+SUM(heap_blks_hit) AS heap_hit,
+(SUM(heap_blks_hit) - SUM(heap_blks_read)) / SUM(heap_blks_hit) AS ratio
+FROM pg_statio_user_tables;
+Table index stats
+SELECT
+relname AS "table name",
+n_live_tup AS "table rows",
+100 * idx_scan / (seq_scan + idx_scan) AS "indexes usage [%]"
+FROM pg_stat_user_tables 
+ORDER BY n_live_tup DESC;
+Index usage stats
+Indexes with idx_* = 0 may be useless
+
+SELECT
+relname AS table_name,
+indexrelname AS index_name,
+idx_scan,
+idx_tup_read,
+idx_tup_fetch,
+((pg_relation_size(indexrelname::regclass))/1024/1024) AS size
+FROM pg_stat_all_indexes
+WHERE schemaname = 'public'
+ORDER BY idx_scan DESC;
+Running queries
+SELECT pid, age(clock_timestamp(), query_start), datname, usename, query, state
+FROM pg_stat_activity
+WHERE state NOT LIKE 'idle%' AND query NOT ILIKE '%pg_stat_activity%'
+ORDER BY query_start desc;
+Block new connections to specific DB
+update pg_database set datallowconn = 'false' where datname = 'DB_NAME';
+Terminate current connections to specific DB
+select pg_terminate_backend(pid) from pg_stat_activity where datname = 'DB_NAME';
+Backup & Restore
+Dump schema
+pg_dump --schema-only -U user database > dbschema.sql
+
+You may wanna minify it: egrep -v "^[[:blank:]]*(-|$)" dbschema.sql > dbschema.min.sql
+
+Dump database data
+pg_dump -Fc --data-only -U user database > dbdata.dump
+
+Dump whole database
+pg_dump -Fc -U user database > database.dump
+
+Restore schema
+psql -U user -d database -f dbschema.sql
+
+Restore database or data
+pg_restore --clean -U user -d database db.dump
+
+Query performance
+Activate query timing in PSQL with \timing
+
+Examine a query performance with EXPLAIN (ANALYZE, BUFFERS, TIMING) QUERY;
+
+To do a detailed analysis whithout modifying the data you can:
+
+begin;
+explain (analyze,buffers,timing)
+delete from mydata where id='XX';
+rollback;
+Config file
+$ psql -U postgres -c 'SHOW config_file'
+
+Config file tuner help with pgtune
+
+Manual Upgrade
+su
+su - postgres
+pg_dumpall > /var/lib/postgres/data/data.dump
+pg_ctl stop -D /var/lib/postgres/data
+exit
+mv /var/lib/postgres/data /var/lib/postgres/data_old
+mkdir /var/lib/postgres/data
+chown postgres:postgres /var/lib/postgres/data
+su - postgres
+initdb -D /var/lib/postgres/data
+exit
+systemctl start postgresql
+su - postgres
+psql -d postgres -f /var/lib/postgres/data_old/data.dump
+cp /var/lib/postgres/data_old/postgresql.conf /var/lib/postgres/data/postgresql.conf
+exit
+systemctl restart postgresql
+Just an example of a manual upgrade using dumpall
